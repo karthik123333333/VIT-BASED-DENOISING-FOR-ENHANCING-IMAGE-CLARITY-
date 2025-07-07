@@ -1,0 +1,53 @@
+!wget https://data.vision.ee.ethz.ch/cvl/ntire20/nh-haze/files/NH-HAZE.zip 
+
+import zipfile
+import os
+
+zip_file_path = '/content/NH-HAZE.zip'
+extract_to_path = '/content/dataset'
+
+# Create a directory for extraction
+os.makedirs(extract_to_path, exist_ok=True)
+
+# Unzip the file
+with zipfile.ZipFile(zip_file_path, 'r') as zip_ref:
+    zip_ref.extractall(extract_to_path)
+
+print("File successfully unzipped!")
+
+
+  !pip install timm
+
+  import torch
+import torch.nn as nn
+import timm
+from torchvision import transforms
+from PIL import Image
+
+# Define the necessary transformations for preprocessing the images
+transform = transforms.Compose([
+    transforms.Resize((224, 224)),  # Resize the images to match the input size of the model
+    transforms.ToTensor(),          # Convert the images to tensors
+])
+
+class CustomDataset(torch.utils.data.Dataset):
+    def __init__(self, root_dir):
+        self.root_dir = root_dir
+        self.image_list = os.listdir(root_dir)
+
+    def __len__(self):
+        return len(self.image_list)
+
+    def __getitem__(self, idx):
+        # Load the haze and ground truth images
+        haze_image_path = os.path.join(self.root_dir, self.image_list[idx])
+        gt_image_path = haze_image_path.replace('hazy', 'GT')
+
+        haze_image = Image.open(haze_image_path)
+        gt_image = Image.open(gt_image_path)
+
+        # Apply transformations
+        haze_image = transform(haze_image)
+        gt_image = transform(gt_image)
+
+        return haze_image, gt_image
