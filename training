@@ -51,3 +51,202 @@ class CustomDataset(torch.utils.data.Dataset):
         gt_image = transform(gt_image)
 
         return haze_image, gt_image
+
+dataset = CustomDataset('/content/dataset/NH-HAZE')  
+
+import torch
+import torch.nn as nn
+import timm
+
+class ViTEncoder(nn.Module):
+    def __init__(self, pretrained=True, num_classes=0):
+        super(ViTEncoder, self).__init__()
+        self.vit = timm.create_model('vit_base_patch16_224', pretrained=pretrained, num_classes=num_classes)
+        self.adaptation = nn.Sequential(
+            nn.Linear(768, 768 * 32 * 32),  # Adjusting size for reshaping to (batch, 768, 32, 32)
+            nn.ReLU()
+        )
+
+    def forward(self, x):
+        x = self.vit(x)
+        x = self.adaptation(x)
+        x = x.view(x.size(0), 768, 32, 32)  # Reshape to (batch, channels, height, width)
+        return x
+
+class DehazeFormer(nn.Module):
+    def __init__(self):
+        super(DehazeFormer, self).__init__()
+        self.layers = nn.Sequential(
+            nn.Conv2d(768, 768, kernel_size=3, padding=1, bias=False),
+            nn.ReLU(),
+            nn.BatchNorm2d(768)
+        )
+
+    def forward(self, x):
+        return self.layers(x)
+
+
+class FusionModule(nn.Module):
+    def __init__(self):
+        super(FusionModule, self).__init__()
+        # Correcting the output dimension to match the desired reshape
+        self.fusion_linear = nn.Linear(768 * 2 * 32 * 32, 2048)  # Changed from 1024 to 2048
+        self.fusion_conv = nn.Sequential(
+            nn.Conv2d(512, 512, kernel_size=3, padding=1),
+            nn.ReLU()
+        )
+
+    def forward(self, x):
+        x = x.view(x.size(0), -1)  # Flatten the features before passing to linear
+        x = self.fusion_linear(x)
+        x = x.view(x.size(0), 512, 2, 2)  # Correct dimensions for the expected reshaping
+        x = self.fusion_conv(x)
+        return x
+
+class DeepLabDecoder(nn.Module):
+    def __init__(self):
+        super(DeepLabDecoder, self).__init__()
+        self.upsample1 = nn.Upsample(scale_factor=28, mode='bilinear', align_corners=False)  # Initial large scale up
+        self.conv1 = nn.Conv2d(512, 256, kernel_size=3, padding=1)
+        self.relu1 = nn.ReLU()
+        self.upsample2 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)  # Additional upsampling
+        self.conv2 = nn.Conv2d(256, 128, kernel_size=3, padding=1)
+        self.relu2 = nn.ReLU()
+        self.upsample3 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)  # Final size adjustment
+        self.conv3 = nn.Conv2d(128, 3, kernel_size=3, padding=1)  # Match the channel count of target images
+        self.relu3 = nn.ReLU()
+
+    def forward(self, x):
+        x = self.upsample1(x)
+        x = self.conv1(x)
+        x = self.relu1(x)
+        x = self.upsample2(x)
+        x = self.conv2(x)
+        x = self.relu2(x)
+        x = self.upsample3(x)
+        x = self.conv3(x)
+        x = self.relu3(x)
+        return x
+
+class CompleteModel(nn.Module):
+    def __init__(self):
+        super(CompleteModel, self).__init__()
+        self.encoder = ViTEncoder()
+        self.dehazer = DehazeFormer()
+        self.fusion = FusionModule()
+        self.decoder = DeepLabDecoder()
+
+    def forward(self, x):
+        enc_feats = self.encoder(x)
+
+        dehaze_feats = self.dehazer(enc_feats)
+
+
+        fused_feats = self.fusion(torch.cat((enc_feats, dehaze_feats), dim=1))
+
+        output = self.decoder(fused_feats)
+
+        return output
+
+if __name__ == "__main__":
+    dummy_input = torch.randn(1, 3, 224, 224)
+    model = CompleteModel()
+    output = model(dummy_input)
+    print(output.shape)  
+
+
+
+
+# Check for CUDA
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Using device:", device)
+
+# Move the model to the device (GPU or CPU)
+model = CompleteModel().to(device)
+
+
+
+num_epochs = 5
+
+
+# Define data loader
+data_loader = torch.utils.data.DataLoader(dataset, batch_size=1, shuffle=True)
+
+# Define loss function and optimizer
+criterion = nn.MSELoss()
+optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+
+# Train your model
+for epoch in range(num_epochs):
+    for batch_idx, (haze_images, gt_images) in enumerate(data_loader):
+        # Move data to the same device as the model
+        haze_images = haze_images.to(device)
+        gt_images = gt_images.to(device)
+
+        # Zero the parameter gradients
+        optimizer.zero_grad()
+
+        # Forward pass
+        output = model(haze_images)
+        loss = criterion(output, gt_images)
+
+        # Backward pass and optimize
+        loss.backward()
+        optimizer.step()
+
+        if batch_idx % 10 == 0:
+            print(f'Epoch {epoch}, Batch {batch_idx}, Loss: {loss.item()}') 
+
+
+
+import torch
+
+# Specify the path to save the model and optimizer
+save_path = '/content/drive/MyDrive/Qriocity/models/'
+
+# Create the directory if it doesn't exist
+!mkdir -p "$save_path"
+
+# Save the model and optimizer state_dicts
+torch.save({
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            }, save_path + 'model_and_optimizer.pth')
+
+
+
+
+
+import torch
+import torch.nn.functional as F
+
+def psnr(img1, img2):
+    mse = torch.mean((img1 - img2) ** 2)
+    if mse == 0:
+        return 100
+    max_pixel = 1.0
+    psnr = 20 * torch.log10(max_pixel / torch.sqrt(mse))
+    return psnr
+
+def ssim(img1, img2, window_size=11, sigma=1.5):
+    mu1 = F.conv2d(img1, torch.ones(1, 1, window_size, window_size) / (window_size ** 2), padding=window_size // 2)
+    mu2 = F.conv2d(img2, torch.ones(1, 1, window_size, window_size) / (window_size ** 2), padding=window_size // 2)
+    mu1_sq = mu1 ** 2
+    mu2_sq = mu2 ** 2
+    mu1_mu2 = mu1 * mu2
+
+    sigma1_sq = F.conv2d(img1 ** 2, torch.ones(1, 1, window_size, window_size) / (window_size ** 2), padding=window_size // 2) - mu1_sq
+    sigma2_sq = F.conv2d(img2 ** 2, torch.ones(1, 1, window_size, window_size) / (window_size ** 2), padding=window_size // 2) - mu2_sq
+    sigma12 = F.conv2d(img1 * img2, torch.ones(1, 1, window_size, window_size) / (window_size ** 2), padding=window_size // 2) - mu1_mu2
+
+    C1 = (0.01) ** 2
+    C2 = (0.03) ** 2
+
+    ssim_map = ((2 * mu1_mu2 + C1) * (2 * sigma12 + C2)) / ((mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2))
+
+    return torch.mean(ssim_map)
+psnr_value = psnr(output, gt_images)
+ssim_value = ssim(output, gt_images)
+
+print("PSNR values:", psnr_value)
+print("SSIM values:", ssim_value)
